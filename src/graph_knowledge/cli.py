@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import sys
 
-from graph_knowledge.extraction import RuleBasedExtractor
+from graph_knowledge.extraction import LLMExtractor, RuleBasedExtractor
+from graph_knowledge.extraction.base import Extractor
+from graph_knowledge.extraction.llm import DEFAULT_MODEL
 from graph_knowledge.pipeline import Pipeline
 from graph_knowledge.store.base import GraphStore
 
@@ -20,6 +22,12 @@ def build_store(backend: str, path: str) -> GraphStore:
     return EmbeddedStore(path)
 
 
+def build_extractor(kind: str, model: str, effort: str | None) -> Extractor:
+    if kind == "llm":
+        return LLMExtractor(model=model, effort=effort)
+    return RuleBasedExtractor()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="graph-knowledge")
     parser.add_argument("text", nargs="?", help="text to ingest; omit to read stdin")
@@ -27,6 +35,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backend", choices=["neo4j", "embedded"], default="neo4j")
     parser.add_argument("--path", default="./data/graph", help="embedded backend path")
     parser.add_argument("--person", help="after ingesting, show this person's graph")
+    parser.add_argument(
+        "--extractor",
+        choices=["rule", "llm"],
+        default="rule",
+        help="rule: offline baseline; llm: Claude with a validated schema (needs ANTHROPIC_API_KEY)",
+    )
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="model for --extractor llm")
+    parser.add_argument(
+        "--effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help="thinking effort for --extractor llm; omit for the API default",
+    )
     args = parser.parse_args(argv)
 
     text = args.text if args.text is not None else sys.stdin.read()
@@ -36,7 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     store = build_store(args.backend, args.path)
     store.initialize()
     try:
-        extraction = Pipeline(RuleBasedExtractor(), store).ingest(text, args.doc_id)
+        extractor = build_extractor(args.extractor, args.model, args.effort)
+        extraction = Pipeline(extractor, store).ingest(text, args.doc_id)
 
         print(f"Extracted from {args.doc_id!r}:")
         for person in extraction.people:

@@ -35,6 +35,13 @@ python -m graph_knowledge.cli "Mary went to the bank. She withdrew some money." 
 make test-embedded
 ```
 
+With the LLM extractor (needs `ANTHROPIC_API_KEY`, or an `ant auth login` profile):
+
+```bash
+python -m graph_knowledge.cli "Mary went to the bank. She withdrew some money." \
+    --extractor llm
+```
+
 ## Why activities are nodes, not edges
 
 The obvious modelling is `(:Person)-[:activity {attributes:{...}}]->(:Place)`.
