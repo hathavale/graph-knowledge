@@ -6,6 +6,9 @@
 *.ladybug/
 /data/
 
+# Eval run outputs (results, traces). Regenerate with `make eval-*`.
+/.eval/
+
 __pycache__/
 *.py[cod]
 .venv/

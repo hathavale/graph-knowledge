@@ -77,19 +77,43 @@ NOUN_SYNONYMS = {
     "pounds": "money", "pound": "money", "cash": "money", "funds": "money",
 }
 
+# Capitalised function words that start sentences; never person names.
+NON_NAMES = DETERMINERS | {
+    "this", "that", "these", "those", "there", "it", "its", "no", "all",
+    "both", "each", "every", "after", "before", "when", "while", "however",
+    "if", "as", "at", "in", "on", "for", "we", "they", "you", "i",
+}
+
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _WORD_RE = re.compile(r"[A-Za-z']+")
 _MONEY_RE = re.compile(r"(?:[$£€]\s?([\d,]+(?:\.\d+)?)|\b([\d,]+(?:\.\d+)?)\s+(dollars|euros|pounds))")
 
 
 def _lemma(verb: str) -> str:
+    """Crude stemmer: irregulars by table, then suffix stripping.
+
+    Restoring a dropped "e" ("escalat" -> "escalate") is not attempted --
+    "audited" -> "audit" and "escalated" -> "escalate" are indistinguishable
+    without a lexicon, and guessing wrong is worse than under-stemming. This
+    is a known limitation of the baseline; the LLM extractor does not have it.
+    """
     low = verb.lower()
     if low in LEMMAS:
         return LEMMAS[low]
     for suffix, cut in (("ied", 3), ("ed", 2), ("es", 2), ("s", 1)):
         if low.endswith(suffix) and len(low) - cut >= 3:
             base = low[: len(low) - cut]
-            return base + "y" if suffix == "ied" else base
+            if suffix == "ied":
+                return base + "y"
+            # "flagged" -> "flagg" -> "flag"; leave "ss"/"ll"/"ff" alone.
+            if (
+                len(base) >= 3
+                and base[-1] == base[-2]
+                and base[-1] not in "slfz"
+                and base[-1] not in "aeiou"
+            ):
+                base = base[:-1]
+            return base
     return low
 
 
@@ -157,7 +181,7 @@ class RuleBasedExtractor:
                 last_person.gender = gender
             return last_person, tokens[1:]
 
-        if head[:1].isupper():
+        if head[:1].isupper() and low not in NON_NAMES:
             # Consume a run of capitalised tokens as one name ("Mary Jane").
             span = 1
             while span < len(tokens) and tokens[span][:1].isupper():

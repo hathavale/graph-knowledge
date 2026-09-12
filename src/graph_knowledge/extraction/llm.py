@@ -163,6 +163,9 @@ class LLMExtractor:
         self._model = model
         self._max_tokens = max_tokens
         self._effort = effort
+        #: The raw response from the most recent call. The eval runner reads
+        #: usage, the served model and stop_reason off this.
+        self.last_response: Any | None = None
 
     @property
     def client(self) -> Any:
@@ -176,6 +179,7 @@ class LLMExtractor:
 
     def extract(self, text: str, doc_id: str) -> Extraction:
         response = self._call(text)
+        self.last_response = response
         raw = getattr(response, "parsed_output", None)
         if raw is None:
             raise ExtractionError(

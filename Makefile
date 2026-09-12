@@ -1,4 +1,5 @@
-.PHONY: help install up down logs shell test test-embedded test-integration df prune reclaim nuke
+.PHONY: help install up down logs shell test test-embedded test-integration \
+	 eval-oracle eval-null eval-rule eval-llm df prune reclaim nuke
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -26,6 +27,22 @@ test-embedded:  ## Run the suite against the embedded backend only (no Docker ne
 
 test-integration:  ## Run the suite against Neo4j (requires `make up`)
 	pytest -v -k neo4j
+
+# ---------------------------------------------------------------------------
+# Eval. oracle/null/rule cost nothing; only eval-llm calls the API.
+# ---------------------------------------------------------------------------
+
+eval-oracle:  ## Harness self-test: gold replayed, must score 1.00
+	python evals/run_eval.py --extractor oracle --out .eval/oracle
+
+eval-null:  ## Null baseline: extracts nothing, must score 0.00
+	python evals/run_eval.py --extractor null --out .eval/null
+
+eval-rule:  ## Offline rule-based baseline
+	python evals/run_eval.py --extractor rule --variant rule-baseline --out .eval/rule
+
+eval-llm:  ## Run the LLM extractor. COSTS MONEY. Iterate on train, confirm on test.
+	python evals/run_eval.py --extractor llm --variant llm --slice train --reps 2 --out .eval/llm-train
 
 # ---------------------------------------------------------------------------
 # Disk hygiene. On macOS the Docker VM lives in one sparse file that grows to a

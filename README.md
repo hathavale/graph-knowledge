@@ -145,6 +145,28 @@ src/graph_knowledge/
 tests/test_mary.py         # the worked example, run against every backend
 ```
 
+## Eval
+
+`evals/` measures the extractor on 40 hand-written meeting-notes passages,
+scored per atomic fact (person / gender / travel / activity / attribute /
+datetime) rather than whole-graph, so a regression is attributable.
+
+```bash
+make eval-oracle   # harness self-test: gold replayed, must score 1.00, free
+make eval-null     # null baseline: must score 0.00, free
+make eval-rule     # offline rule-based baseline, free
+make eval-llm      # the LLM extractor -- costs money
+```
+
+| variant | P | R | F1 |
+|---|---|---|---|
+| oracle | 1.00 | 1.00 | 1.00 |
+| rule-based | 0.58 | 0.46 | 0.51 |
+| null | 1.00 | 0.00 | 0.00 |
+
+`evals/README.md` covers the fact model, accept-lists, the train/test split,
+the noise floor, and the known limitations.
+
 ## Status and next steps
 
 The rule-based extractor is a **baseline**, not the destination. It resolves
