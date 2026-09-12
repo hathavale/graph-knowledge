@@ -1,0 +1,15 @@
+# Neo4j bind-mount data. Keeping the DB here (not in a named volume) is
+# deliberate -- see README. It must never be committed.
+/neo4j/
+
+# Embedded graph store files
+*.ladybug/
+/data/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.env
