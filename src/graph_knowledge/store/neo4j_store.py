@@ -52,7 +52,7 @@ class Neo4jStore:
         user: str | None = None,
         password: str | None = None,
     ) -> None:
-        from neo4j import GraphDatabase
+        from neo4j import GraphDatabase, NotificationDisabledClassification
 
         self._driver = GraphDatabase.driver(
             uri or os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
@@ -60,6 +60,15 @@ class Neo4jStore:
                 user or os.environ.get("NEO4J_USER", "neo4j"),
                 password or os.environ.get("NEO4J_PASSWORD", "password"),
             ),
+            # Reading a property that is null everywhere -- `datetime` until a
+            # document actually states one -- makes Neo4j warn that the key
+            # does not exist. That is this schema working as designed: null
+            # properties are not stored, so the key only appears once a real
+            # value does. Silence that class only; PERFORMANCE and DEPRECATION
+            # notifications stay on, and those are worth reading.
+            notifications_disabled_classifications=[
+                NotificationDisabledClassification.UNRECOGNIZED
+            ],
         )
 
     def initialize(self) -> None:

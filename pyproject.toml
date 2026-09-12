@@ -9,7 +9,7 @@ description = "Build a knowledge graph of people, places and activities from fre
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0",
-    "neo4j>=5.0",
+    "neo4j>=5.22",
 ]
 
 [project.optional-dependencies]
