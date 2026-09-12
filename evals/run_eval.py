@@ -60,6 +60,30 @@ PRICES = {
 }
 
 
+def credentials_available() -> bool:
+    """Mirror the SDK's credential resolution order.
+
+    Checked before the run rather than per call: without this, a missing key
+    produces one identical error row per attempt instead of one clear message.
+    """
+    import os
+
+    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        return True
+    if (Path.home() / ".config" / "anthropic").exists():
+        return True
+    return all(
+        os.environ.get(var)
+        for var in (
+            "ANTHROPIC_FEDERATION_RULE_ID",
+            "ANTHROPIC_ORGANIZATION_ID",
+            "ANTHROPIC_SERVICE_ACCOUNT_ID",
+        )
+    ) and bool(
+        os.environ.get("ANTHROPIC_IDENTITY_TOKEN_FILE") or os.environ.get("ANTHROPIC_IDENTITY_TOKEN")
+    )
+
+
 def load_cases(path: Path = CASES) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
@@ -198,6 +222,14 @@ def cost_of(usage: dict, model: str | None) -> float | None:
 
 
 def run(args) -> int:
+    if args.extractor == "llm" and not credentials_available():
+        print(
+            "No API credentials found. Set ANTHROPIC_API_KEY, or run `ant auth login`.\n"
+            "The free variants need no credentials: --extractor oracle | null | rule",
+            file=sys.stderr,
+        )
+        return 2
+
     cases = load_cases(Path(args.cases))
     split = make_split(cases)
     if args.slice != "all":

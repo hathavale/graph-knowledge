@@ -223,6 +223,14 @@ class LLMExtractor:
             raise ExtractionError("could not reach the API") from exc
         except ValidationError as exc:
             raise ExtractionError(f"response did not match the schema: {exc}") from exc
+        except TypeError as exc:
+            # The SDK raises a bare TypeError when no credential source
+            # resolves. On its own that reads as a bug in this code.
+            if "authentication" in str(exc).lower():
+                raise ExtractionError(
+                    "no API credentials found -- set ANTHROPIC_API_KEY or run `ant auth login`"
+                ) from exc
+            raise
 
     # -- mapping -------------------------------------------------------------
 

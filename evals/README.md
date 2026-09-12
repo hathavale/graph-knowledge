@@ -101,6 +101,32 @@ to the mean and produces train gains that never appear on held-out data.
 `tests/test_eval_harness.py` enforces the two bounds in CI: oracle scores 1.0,
 null scores 0.0.
 
+## Running the LLM variant
+
+Needs credentials — `ANTHROPIC_API_KEY`, or an `ant auth login` profile. The
+runner checks before the loop and exits 2 with a message rather than
+producing one identical error row per attempt.
+
+```bash
+make eval-llm                                    # train slice, 2 reps
+python evals/run_eval.py --extractor llm --slice test --reps 2 --out .eval/llm-test
+```
+
+Rough spend for the train slice (28 cases x 2 reps = 56 calls), estimated
+from character counts rather than `count_tokens`, so treat it as an order of
+magnitude. The system prompt (~500 tokens) is cached after the first call;
+case texts are ~15 tokens each, so output tokens dominate and adaptive
+thinking is the variable that matters:
+
+| output tokens/call | estimated cost |
+|---|---|
+| ~400 | $0.58 |
+| ~900 | $1.28 |
+| ~1800 | $2.54 |
+
+The first run prints the real figure from the API's own token counts. Use
+`--effort low` to cut thinking tokens if the quality holds.
+
 ## Baselines
 
 | variant | overall P | R | F1 |
