@@ -1,3 +1,3 @@
-from graph_knowledge.store.base import ActivityRow, GraphStore, TravelRow
+from graph_knowledge.store.base import ExpertRow, GraphStore, OrgFactRow, TicketPersonRow
 
-__all__ = ["ActivityRow", "GraphStore", "TravelRow"]
+__all__ = ["ExpertRow", "GraphStore", "OrgFactRow", "TicketPersonRow"]

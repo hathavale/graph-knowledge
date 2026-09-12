@@ -1,188 +1,163 @@
 # graph-knowledge
 
-Build a knowledge graph of people, places and activities from free text.
+Builds a knowledge graph from support tickets so a future ticket can be routed
+to the right people — **who to notify, with what context, and who else to keep
+in the loop.**
 
 ```
-"Mary went to the bank. She withdrew some money."
+"Checkout is returning 502s from the payment gateway. @raj picked it up
+ but said to ask Priya, she wrote the retry logic."
 ```
 
 becomes
 
 ```cypher
-(:Person {name:"Mary", gender:"Female"})-[:TRAVEL {datetime:null}]->(:Place {type:"Bank"})
-(:Person {name:"Mary", gender:"Female"})-[:PERFORMED]->
-    (:Activity {type:"withdraw money", datetime:null})-[:AT]->(:Place {type:"Bank"})
-(:Activity)-[:HAS_ATTRIBUTE]->(:Attribute {name:"amount", value:null})
+(:Ticket {id:"SUP-1042"})-[:ABOUT]->(:Topic {name:"payment gateway"})
+(:Person {name:"Raj"})-[:PARTICIPATED_IN {role:"assignee"}]->(:Ticket)
+(:Ticket)-[:MENTIONS {role:"expert", excerpt:"ask Priya, she wrote the retry logic",
+                      confidence:0.8}]->(:Person {name:"Priya"})
+(:Alias {value:"@raj"})-[:ALIAS_OF]->(:Person {name:"Raj"})
 ```
 
-Both statements point at the **same** bank node, and `"She"` is what supplies
-Mary's gender.
+Ask it who knows about the payment gateway and it answers with the evidence
+that nominated them:
+
+```
+Priya: 1 expert mention, 0 tickets worked
+    "ask Priya, she wrote the retry logic"
+Raj:   0 expert mentions, 1 ticket worked
+```
 
 ## Quickstart
 
 ```bash
-make install          # pip install -e '.[dev,embedded]'
-make up               # start Neo4j (waits until healthy)
-make test             # run the suite
-open http://localhost:7474    # Neo4j Browser: user neo4j, password password
+make install
+make up                       # start Neo4j
+make test                     # 46 tests; 54 with Neo4j running
+make eval-oracle              # harness self-test, free
+export ANTHROPIC_API_KEY=...
+python -m graph_knowledge.cli "…ticket text…" --ticket-id SUP-1042
 ```
 
-No Docker? The embedded backend needs no server at all:
+## Two layers, separated by provenance
 
-```bash
-python -m graph_knowledge.cli "Mary went to the bank. She withdrew some money." \
-    --backend embedded --path ./data/graph
-make test-embedded
-```
+The central design decision. Facts about **who someone is** and facts about
+**what they know** have very different reliability, and mixing them is how a
+router ends up escalating to a manager who doesn't exist.
 
-With the LLM extractor (needs `ANTHROPIC_API_KEY`, or an `ant auth login` profile):
-
-```bash
-python -m graph_knowledge.cli "Mary went to the bank. She withdrew some money." \
-    --extractor llm
-```
-
-## Why activities are nodes, not edges
-
-The obvious modelling is `(:Person)-[:activity {attributes:{...}}]->(:Place)`.
-That does not work, for two reasons that apply to every property-graph engine:
-
-1. **No nested map properties.** Property values must be primitives or arrays
-   of primitives, so `attributes: {entity:..., property:...}` cannot be stored
-   on an edge.
-2. **Edges cannot carry edges.** An activity modelled as an edge has nowhere to
-   hang its attributes, participants, provenance or confidence later.
-
-So activities are *reified* into nodes, and their attributes become
-`(:Attribute)` nodes. This also gives a clean way to say **known to be
-unknown**: a property set to null is indistinguishable from an absent
-property, but an `Attribute {name:"amount", value:null}` node records that an
-amount exists and was not stated.
-
-`TRAVEL` stays a plain edge — it has no sub-structure.
-
-## Entity keys
-
-Every node has a deterministic `key`, and all writes are `MERGE` on it, so
-re-ingesting a document changes nothing.
-
-| Entity | Key | Rationale |
+| | Identity & org | Expertise & involvement |
 |---|---|---|
-| Person | `person:mary` | global — the same person across documents is one node |
-| Named place | `place:chase-bank` | global |
-| Unnamed place | `place:doc:<doc>:bank` | **document-scoped** |
-| Activity | `activity:doc:<doc>:<i>:<type>` | events are always document-scoped |
-| Attribute | `<activity key>:attr:amount` | owned by its activity |
+| `REPORTS_TO`, `MEMBER_OF`, `HAS_FUNCTION` | `PARTICIPATED_IN`, `MENTIONS`, `ABOUT` |
+| Authoritative when imported from a directory | Only obtainable from tickets |
+| Currently **inferred** — treat as a hint | The signal the product rests on |
 
-The document scoping for unnamed places is the subtle one. Within a passage,
-"the bank" in sentence one and sentence two must unify. Across unrelated
-documents they must not — otherwise every anonymous bank in the corpus
-silently collapses into a single node.
+Every org fact carries `source` (`imported` / `inferred` / `derived`) and a
+confidence. An import overrides an inference; **an inference never downgrades
+an import** — both directions are tested. When you get a directory export,
+import it and the inferred rows are superseded without a migration.
 
-## Two backends, one schema
+Tickets are a poor source for reporting lines and the only source for "who
+actually knows about the retry path".
 
-`GraphStore` (`src/graph_knowledge/store/base.py`) is a small protocol with two
-implementations that share the reified schema and near-identical Cypher:
+## Participation vs mention
 
-- **`Neo4jStore`** — the Docker Compose service. Gets you Neo4j Browser.
-- **`EmbeddedStore`** — LadybugDB, a file on disk, no server.
+The distinction the routing depends on:
 
-The test suite is parametrised over whichever backends are available, so the
-same assertions run against both and the engine choice stays reversible.
-`pytest` is green with or without `make up`.
+- **Participation** — someone acted on the ticket. Behavioural evidence.
+- **Mention** — someone was referenced. `expert`, `escalation`, `approver`,
+  `affected`. A colleague writing *"ask Priya, she wrote the retry logic"* is a
+  deliberate claim about expertise, made in context — a stronger signal than
+  many tickets touched.
 
-## Docker disk hygiene (macOS)
+`experts_for_topic()` returns both counts separately rather than folding them
+into one opaque score; ranking policy belongs in the routing layer.
 
-The Docker VM lives in one sparse file that **grows to a high-water mark and
-never shrinks by itself**. `docker system prune` frees space *inside* the VM
-while the host file stays large — which is why Docker appears to eat a disk
-irreversibly. The setup here is arranged to prevent that:
+## Evidence is not optional
 
-- **Set a virtual disk limit.** Docker Desktop → Settings → Resources →
-  Advanced → Disk image size → 24–32 GB. This is the highest-value change:
-  it turns "laptop unusable" into "Docker prints an error". Lowering it
-  recreates the disk image, so do it before you have data you care about.
-- **Data is bind-mounted**, not in a named volume. `./neo4j/data` lives on the
-  host filesystem: visible to `du -sh`, backed up with `cp -r`, invisible to
-  `Docker.raw`, and immune to `docker system prune --volumes`.
-- **Logs are capped** (`max-size: 10m`, `max-file: 3`) in `docker-compose.yml`.
-  Uncapped container logs are a common way to fill the VM.
-- **Neo4j query logging is off** — it is on by default in 5.x and writes
-  continuously.
-- Cap the build cache in `~/.docker/daemon.json` (Settings → Docker Engine).
-  Use `reservedSpace`/`maxUsedSpace`; `defaultKeepStorage` is deprecated in
-  Engine 28+:
+Every inferred fact carries the ticket it came from and the excerpt supporting
+it. A routing decision that cannot say *why* someone was chosen is not
+reviewable, and an unreviewable notifier gets muted. The excerpt is also what a
+draft notification quotes back.
 
-  ```json
-  {
-    "log-opts": { "max-size": "10m", "max-file": "3" },
-    "builder": { "gc": { "enabled": true,
-      "policy": [{ "reservedSpace": "4GB", "maxUsedSpace": "8GB" }] } }
-  }
-  ```
+## A vocabulary that evolves without drifting
 
-```bash
-make df        # what Docker is actually using
-make prune     # drop unused images and build cache
-make reclaim   # TRIM the VM disk so macOS gets the space back  <-- the missing step
-make nuke      # delete the container AND ./neo4j. destructive.
-```
+The model is meant to grow with LLM input. Unconstrained, that yields
+`payment gateway`, `payment-gateway` and `billing gateway` as three unrelated
+topics within a week, and every routing query silently misses two thirds of its
+evidence.
+
+So `vocabulary.py` holds a controlled vocabulary *in the graph*:
+
+- Extraction is constrained to **canonical** terms, which are what the prompt
+  lists.
+- Anything new comes back as a **proposal**, not a written fact.
+- A proposal is promoted once enough **distinct tickets** support it — one
+  ticket saying a thing five times is still one piece of evidence.
+- `alias()` folds a duplicate spelling into an existing term without rewriting
+  history; `reject()` is permanent, so a curation decision is not undone by
+  repetition.
+
+A small, stable canonical list is also what keeps the system prompt cacheable.
 
 ## Layout
 
 ```
 src/graph_knowledge/
-├── models.py              # Pydantic domain model + key strategy
-├── pipeline.py            # extractor -> store
+├── models.py        # Person, Ticket, Topic, Mention, OrgFact, Evidence
+├── vocabulary.py    # canonical / proposed / rejected terms + promotion
+├── pipeline.py      # extract → observe terms → persist
 ├── cli.py
-├── extraction/
-│   ├── base.py            # Extractor protocol
-│   └── rule_based.py      # deterministic baseline, no API key needed
+├── extraction/      # Extractor protocol + LLM extractor (structured outputs)
 └── store/
-    ├── base.py            # GraphStore protocol
+    ├── _cypher.py   # statements shared by both backends
     ├── neo4j_store.py
     └── embedded_store.py
-tests/test_mary.py         # the worked example, run against every backend
+evals/               # 24 ticket cases, per-fact grader, bounded harness
 ```
 
 ## Eval
 
-`evals/` measures the extractor on 40 hand-written meeting-notes passages,
-scored per atomic fact (person / gender / travel / activity / attribute /
-datetime) rather than whole-graph, so a regression is attributable.
+Per atomic fact — `person`, `alias`, `topic`, `participation`, `mention`, `org`
+— so a regression is attributable. 101 gold facts across 24 cases, eight
+categories of three.
 
 ```bash
-make eval-oracle   # harness self-test: gold replayed, must score 1.00, free
-make eval-null     # null baseline: must score 0.00, free
-make eval-rule     # offline rule-based baseline, free
-make eval-llm      # the LLM extractor -- costs money
+make eval-oracle    # must be 1.00 — gold replayed
+make eval-null      # must be 0.00 — grader isn't lenient
+make eval-llm       # costs money
 ```
 
-| variant | P | R | F1 |
-|---|---|---|---|
-| oracle | 1.00 | 1.00 | 1.00 |
-| rule-based | 0.58 | 0.46 | 0.51 |
-| null | 1.00 | 0.00 | 0.00 |
+**20 of 24 cases assert that no org fact should be produced.** Inventing
+structure is the failure that messages the wrong person, so the set pushes
+against it and the runner prints invented org facts separately.
 
-`evals/README.md` covers the fact model, accept-lists, the train/test split,
-the noise floor, and the known limitations.
+| slice | cases | facts | 1 rep | 2 reps |
+|---|---|---|---|---|
+| full | 24 | 101 | ±10 | ±7 |
+| train | 16 | 67 | ±12 | ±9 |
+| test | 8 | 34 | ±17 | ±12 |
 
-## Status and next steps
+Iterate on `--slice train`, confirm on `--slice test`, and treat a test move
+under 12 points as noise. Every category appears on both sides of the split.
 
-The rule-based extractor is a **baseline**, not the destination. It resolves
-pronouns to the most recent person and recognises travel/activity clauses from
-seed lexicons — enough to exercise the pipeline offline and to make the schema
-concrete. It will not generalise to arbitrary prose.
+## Status
 
-The real path, both of which plug in behind `Extractor` without touching the
-store or the tests:
+Working and tested: the schema, both backends, the vocabulary gate, extraction
+mapping and validation, and the eval harness. **The live API call is still
+unverified** — the request shape and generated JSON schema are checked locally,
+but no request has reached the API from this repo.
 
-1. **Statistical coreference** — `fastcoref` or `maverick-coref` instead of
-   "most recent person". This is where accuracy is won or lost.
-2. **An LLM constrained to the `Extraction` schema** for relation and attribute
-   extraction, with the Pydantic models as the validation boundary so bad
-   extractions fail loudly instead of polluting the graph.
+The cases are author-written. Replacing them with real tickets — and using
+*who actually participated* as gold for routing — is the biggest upgrade
+available, and needs no hand-annotation.
 
-Further out: temporal resolution ("last Tuesday" → a datetime), entity
-resolution beyond exact name match, and provenance edges back to the source
-sentence.
+## Next
+
+1. **Retrieval and context packs.** The token argument only pays off when a
+   query returns a small ranked subgraph instead of ticket text. Not built yet.
+2. **The routing decision** — candidates, ranking, loop-in set, drafted
+   message. Recommend-only until precision is measured on real tickets.
+3. **Directory import.** The two-layer split is in place and tested; the
+   importer is not written.
+4. **Recency decay** on expertise. Counts are currently flat, so someone who
+   worked a topic two years ago ranks alongside someone who worked it last week.

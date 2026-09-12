@@ -1,16 +1,13 @@
-"""LLM-backed extractor.
+"""LLM extraction of ticket facts, validated against a schema.
 
-Uses structured outputs (`client.messages.parse`) so the model's response is
-validated against a Pydantic schema before it reaches the graph. The schema is
-the validation boundary: a malformed extraction raises here rather than
-quietly writing nonsense into the store.
+Constrained by the controlled vocabulary: the canonical topic and function
+lists go into the prompt, and anything outside them is returned separately as
+a *proposal* rather than written straight into the graph. That is what lets
+the model evolve without drifting -- see `vocabulary.py`.
 
-The model emits a *flat* document with local string ids rather than the nested
-domain model. Two reasons: a nested shape would make the model repeat each
-person inside every travel and activity (inviting "Mary" with a gender in one
-place and without in another), and flat ids let us verify referential
-integrity ourselves -- an activity pointing at a person the model never
-declared is a bug we want to catch, not persist.
+As before, the model emits a flat document with local ids and we check
+referential integrity ourselves, so a mention pointing at a person the model
+never declared raises rather than being persisted.
 """
 
 from __future__ import annotations
@@ -22,14 +19,20 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from graph_knowledge.models import (
-    Activity,
-    ActivityEvent,
-    Attribute,
-    Extraction,
+    Evidence,
+    Mention,
+    MentionRole,
+    OrgFact,
+    OrgRelation,
+    Participation,
+    ParticipationRole,
     Person,
-    Place,
-    Travel,
+    Source,
+    Ticket,
+    TicketExtraction,
+    Topic,
 )
+from graph_knowledge.vocabulary import TermKind, Vocabulary
 
 __all__ = ["ExtractionError", "LLMExtractor", "DEFAULT_MODEL"]
 
@@ -40,102 +43,114 @@ DEFAULT_MAX_TOKENS = 16000
 
 
 class ExtractionError(RuntimeError):
-    """The model's output could not be turned into a valid Extraction."""
+    """The model's output could not be turned into a valid extraction."""
 
 
-# --- the model-facing schema ------------------------------------------------
-# Optional fields carry no defaults on purpose: structured outputs requires
-# every property to be present, so the model must emit an explicit null rather
-# than omit the key. That distinction is the whole point of this pipeline.
+# --- model-facing schema ----------------------------------------------------
+# No defaults on optional fields: structured outputs requires every property to
+# be present, so the model must emit an explicit null rather than omit a key.
 
 
 class _LLMPerson(BaseModel):
     id: str
     name: str
-    gender: str | None
+    aliases: list[str]
 
 
-class _LLMPlace(BaseModel):
+class _LLMTopic(BaseModel):
     id: str
-    name: str | None
-    address: str | None
-    type: str | None
-
-
-class _LLMAttribute(BaseModel):
     name: str
-    value: str | None
-    unit: str | None
+    is_new: bool          # not in the canonical list the prompt supplied
 
 
-class _LLMTravel(BaseModel):
+class _LLMParticipation(BaseModel):
     person_id: str
-    place_id: str
-    datetime: str | None
+    role: str
+    at: str | None
 
 
-class _LLMActivity(BaseModel):
+class _LLMMention(BaseModel):
     person_id: str
-    place_id: str | None
-    type: str
-    datetime: str | None
-    attributes: list[_LLMAttribute]
+    role: str
+    topic_id: str | None
+    excerpt: str
+    confidence: float
 
 
-class _LLMExtraction(BaseModel):
+class _LLMOrgFact(BaseModel):
+    person_id: str
+    relation: str
+    target: str
+    excerpt: str
+    confidence: float
+
+
+class _LLMTicketExtraction(BaseModel):
     people: list[_LLMPerson]
-    places: list[_LLMPlace]
-    travels: list[_LLMTravel]
-    activities: list[_LLMActivity]
+    topics: list[_LLMTopic]
+    participations: list[_LLMParticipation]
+    mentions: list[_LLMMention]
+    org_facts: list[_LLMOrgFact]
 
 
-SYSTEM_PROMPT = """\
-You extract a knowledge graph of people, places and activities from text.
+SYSTEM_TEMPLATE = """\
+You extract a knowledge graph from support tickets. Its purpose is to decide,
+for a future ticket, who should be notified and why -- so every fact must be
+traceable to something the ticket actually says.
 
-Return people, places, travels and activities. Give every person and place a
-short lowercase id unique within this document (e.g. "mary", "bank_1"); refer
-to them from travels and activities by those ids only.
+Give each person and topic a short lowercase id unique within this ticket, and
+refer to them by those ids.
 
-Rules:
+PEOPLE
+- Emit a person only for a specific, identifiable individual. Handles
+  (@priya), email addresses and names all count. Do NOT create a person for an
+  unnamed role like "the on-call engineer" or "support".
+- Resolve every reference to one person: "@priya", "Priya", "priya@co.com" and
+  "she" in the same ticket are one entry. Put every spelling seen in `aliases`
+  and use the fullest form as `name`.
 
-1. Coreference. Resolve pronouns and descriptions to the entity they refer to.
-   "Mary went to the bank. She withdrew some money." is two statements about
-   one person, so emit ONE person with id "mary" and have both the travel and
-   the activity reference it.
+PARTICIPATION vs MENTION -- the distinction matters most in this task.
+- A *participation* is someone acting on this ticket: reporting, commenting,
+  being assigned, resolving. Roles: reporter, assignee, commenter, resolver.
+- A *mention* is someone referenced without necessarily acting. Roles:
+    expert       -- named as knowing about something ("ask Priya, she built it")
+    escalation   -- named as who to escalate to
+    approver     -- named as needing to sign off
+    affected     -- named as impacted
+    unspecified  -- referenced with no clear purpose
+- Someone can be both. Emit both entries.
 
-2. Gender. Set gender only when the text evidences it -- a gendered pronoun
-   referring to the person, an explicit statement, or a gendered noun such as
-   "her sister". Use "Female", "Male", or "Other". Never infer gender from a
-   first name alone. Otherwise null.
+TOPICS
+- Use a topic from this list wherever it fits, spelled exactly as given, with
+  is_new = false:
+{topics}
+- If the ticket is clearly about something not in that list, emit it with
+  is_new = true. Prefer an existing topic over a near-duplicate new one:
+  propose a new topic only when nothing listed covers it.
 
-3. Unknowns are null. Never invent a name, address, date or amount that the
-   text does not state. An unnamed place still gets an entry with name null
-   and a type, if the type is stated ("the bank" -> type "Bank").
+ORG FACTS -- be conservative; these are the least reliable thing you produce.
+- relation is one of: REPORTS_TO (target: a person's name), MEMBER_OF (target:
+  a team name), HAS_FUNCTION (target: a job function).
+- Emit one only where the ticket states or plainly implies it ("Priya's
+  manager, Dev", "I'm the PM for billing"). Never guess a function from what
+  someone did, and never guess a reporting line from who answered whom.
+- Known functions: {functions}. Use one of these when it fits; otherwise use
+  the ticket's own wording.
 
-4. Repeated mentions of the same unnamed place within this document are the
-   SAME place and must share one id.
+EVIDENCE
+- Every mention and org fact needs `excerpt`: the shortest span of the ticket
+  that supports it, quoted verbatim. A fact whose excerpt does not support it
+  is worse than a missing fact, because a person will be messaged on it.
+- `confidence` is 0.0-1.0. Use below 0.5 when you are inferring rather than
+  reading, and prefer omitting a fact entirely to asserting a weak one.
 
-5. Activity type is "<base verb> <object>", lowercase, with the verb in its
-   base form: "withdrew some money" -> "withdraw money"; "bought a car" ->
-   "buy car". Normalise currency words to "money".
-
-6. Attributes record properties of an activity. When an activity implies a
-   property the text does not quantify, emit the attribute with a null value:
-   "withdrew some money" -> attribute name "amount", value null. When the text
-   does state it, fill it in: "withdrew 500 dollars" -> name "amount",
-   value "500", unit "dollars".
-
-7. Datetimes are ISO 8601 strings when the text gives an absolute date or
-   time. Do not resolve relative expressions ("last Tuesday") into a date --
-   use null.
-
-8. place_id on an activity is where it happened, when the text supports it --
-   including a place established by a preceding sentence. Otherwise null.
+TIMES
+- ISO 8601 when the ticket gives an absolute date or time. Never resolve a
+  relative expression ("yesterday", "last week") -- use null.
 """
 
 
 def _parse_datetime(value: str | None) -> dt.datetime | None:
-    """ISO 8601 or nothing. An unparseable date is unknown, not a crash."""
     if not value:
         return None
     try:
@@ -145,26 +160,28 @@ def _parse_datetime(value: str | None) -> dt.datetime | None:
         return None
 
 
+def _enum(cls, value: str, default):
+    try:
+        return cls(value.strip().lower())
+    except ValueError:
+        logger.warning("unknown %s %r, using %s", cls.__name__, value, default)
+        return default
+
+
 class LLMExtractor:
-    """Extract entities and relations with Claude, validated against a schema.
-
-    The client is injectable so tests can drive the mapping logic without
-    network access.
-    """
-
     def __init__(
         self,
+        vocabulary: Vocabulary | None = None,
         client: Any | None = None,
         model: str = DEFAULT_MODEL,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         effort: str | None = None,
     ) -> None:
+        self._vocabulary = vocabulary or Vocabulary()
         self._client = client
         self._model = model
         self._max_tokens = max_tokens
         self._effort = effort
-        #: The raw response from the most recent call. The eval runner reads
-        #: usage, the served model and stop_reason off this.
         self.last_response: Any | None = None
 
     @property
@@ -172,21 +189,30 @@ class LLMExtractor:
         if self._client is None:
             import anthropic
 
-            # The SDK retries 429/5xx with backoff on its own (max_retries=2);
-            # don't wrap this in a hand-rolled retry loop.
+            # The SDK retries 429/5xx with backoff; no hand-rolled loop here.
             self._client = anthropic.Anthropic()
         return self._client
 
-    def extract(self, text: str, doc_id: str) -> Extraction:
+    def system_prompt(self) -> str:
+        topics = self._vocabulary.canonical(TermKind.TOPIC)
+        functions = self._vocabulary.canonical(TermKind.FUNCTION)
+        return SYSTEM_TEMPLATE.format(
+            topics="\n".join(f"  - {t}" for t in topics) or "  (none yet)",
+            functions=", ".join(functions) or "none recorded yet",
+        )
+
+    def extract(self, text: str, ticket: Ticket | str) -> TicketExtraction:
+        if isinstance(ticket, str):
+            ticket = Ticket(id=ticket)
         response = self._call(text)
         self.last_response = response
         raw = getattr(response, "parsed_output", None)
         if raw is None:
             raise ExtractionError(
-                f"model returned no parsed output for {doc_id!r} "
+                f"model returned no parsed output for {ticket.id!r} "
                 f"(stop_reason={getattr(response, 'stop_reason', None)!r})"
             )
-        return self._to_domain(raw, text=text, doc_id=doc_id)
+        return self._to_domain(raw, text=text, ticket=ticket)
 
     def _call(self, text: str) -> Any:
         import anthropic
@@ -194,17 +220,13 @@ class LLMExtractor:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "max_tokens": self._max_tokens,
-            # The system prompt is identical on every document, so cache it:
-            # stable content first, the varying document in the user turn.
-            "system": [
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            # Stable across tickets within a vocabulary generation, so it
+            # caches. Promoting a term invalidates it, which is the cost of
+            # letting the vocabulary evolve -- it settles as the set matures.
+            "system": [{"type": "text", "text": self.system_prompt(),
+                        "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": text}],
-            "output_format": _LLMExtraction,
+            "output_format": _LLMTicketExtraction,
             "thinking": {"type": "adaptive"},
         }
         if self._effort is not None:
@@ -215,7 +237,6 @@ class LLMExtractor:
         except anthropic.NotFoundError as exc:
             raise ExtractionError(f"unknown model {self._model!r}") from exc
         except anthropic.RateLimitError as exc:
-            # Raised only after the SDK exhausted its own retries.
             raise ExtractionError("rate limited after SDK retries") from exc
         except anthropic.APIStatusError as exc:
             raise ExtractionError(f"API error {exc.status_code}: {exc.message}") from exc
@@ -224,28 +245,31 @@ class LLMExtractor:
         except ValidationError as exc:
             raise ExtractionError(f"response did not match the schema: {exc}") from exc
         except TypeError as exc:
-            # The SDK raises a bare TypeError when no credential source
-            # resolves. On its own that reads as a bug in this code.
             if "authentication" in str(exc).lower():
                 raise ExtractionError(
                     "no API credentials found -- set ANTHROPIC_API_KEY or run `ant auth login`"
                 ) from exc
             raise
 
-    # -- mapping -------------------------------------------------------------
-
-    def _to_domain(self, raw: _LLMExtraction, text: str, doc_id: str) -> Extraction:
+    def _to_domain(
+        self, raw: _LLMTicketExtraction, text: str, ticket: Ticket
+    ) -> TicketExtraction:
         people: dict[str, Person] = {}
         for item in raw.people:
             if not item.name.strip():
                 logger.warning("skipping person %r with empty name", item.id)
                 continue
-            people[item.id] = Person(name=item.name, gender=item.gender)
+            people[item.id] = Person(name=item.name, aliases=item.aliases)
 
-        places: dict[str, Place] = {
-            item.id: Place(name=item.name, address=item.address, type=item.type)
-            for item in raw.places
-        }
+        topics: dict[str, Topic] = {}
+        proposed: list[str] = []
+        for item in raw.topics:
+            existing = self._vocabulary.resolve(TermKind.TOPIC, item.name)
+            # Fold a proposal onto its canonical spelling when one exists, so
+            # an alias does not enter the graph as a second topic.
+            topics[item.id] = Topic(name=existing.name if existing else item.name)
+            if item.is_new and existing is None:
+                proposed.append(item.name)
 
         def person(ref: str, context: str) -> Person:
             try:
@@ -256,66 +280,53 @@ class LLMExtractor:
                     f"(declared: {sorted(people)})"
                 ) from None
 
-        def place(ref: str, context: str) -> Place:
-            try:
-                return places[ref]
-            except KeyError:
+        participations = [
+            Participation(
+                person=person(p.person_id, "participation"),
+                role=_enum(ParticipationRole, p.role, ParticipationRole.COMMENTER),
+                at=_parse_datetime(p.at),
+            )
+            for p in raw.participations
+        ]
+
+        mentions = []
+        for m in raw.mentions:
+            topic = topics.get(m.topic_id) if m.topic_id else None
+            if m.topic_id and topic is None:
                 raise ExtractionError(
-                    f"{context} references undeclared place id {ref!r} "
-                    f"(declared: {sorted(places)})"
-                ) from None
+                    f"mention references undeclared topic id {m.topic_id!r} "
+                    f"(declared: {sorted(topics)})"
+                )
+            mentions.append(Mention(
+                person=person(m.person_id, "mention"),
+                role=_enum(MentionRole, m.role, MentionRole.UNSPECIFIED),
+                topic=topic,
+                evidence=Evidence(ticket_id=ticket.id, excerpt=m.excerpt,
+                                  confidence=m.confidence),
+            ))
 
-        travels = [
-            Travel(
-                person=person(t.person_id, "travel"),
-                place=place(t.place_id, "travel"),
-                datetime=_parse_datetime(t.datetime),
-            )
-            for t in raw.travels
-        ]
+        org_facts = []
+        for f in raw.org_facts:
+            try:
+                relation = OrgRelation(f.relation.strip().upper())
+            except ValueError:
+                logger.warning("dropping org fact with unknown relation %r", f.relation)
+                continue
+            org_facts.append(OrgFact(
+                person=person(f.person_id, "org fact"),
+                relation=relation,
+                target=f.target,
+                source=Source.INFERRED,
+                evidence=Evidence(ticket_id=ticket.id, excerpt=f.excerpt,
+                                  confidence=f.confidence),
+            ))
 
-        activities = [
-            ActivityEvent(
-                person=person(a.person_id, f"activity {a.type!r}"),
-                activity=Activity(
-                    type=a.type,
-                    datetime=_parse_datetime(a.datetime),
-                    attributes=[
-                        Attribute(name=attr.name, value=attr.value, unit=attr.unit)
-                        for attr in a.attributes
-                    ],
-                ),
-                place=(
-                    place(a.place_id, f"activity {a.type!r}")
-                    if a.place_id is not None
-                    else None
-                ),
-            )
-            for a in raw.activities
-        ]
-
-        # Only surface entities that ended up connected to something -- a
-        # person or place the model declared but never used is noise, not a
-        # fact about the document.
-        used_places = [t.place for t in travels] + [
-            a.place for a in activities if a.place is not None
-        ]
-        used_people = [t.person for t in travels] + [a.person for a in activities]
-
-        return Extraction(
-            doc_id=doc_id,
-            text=text,
-            people=_unique(used_people),
-            places=_unique(used_places),
-            travels=travels,
-            activities=activities,
+        return TicketExtraction(
+            ticket=ticket, text=text,
+            people=list(people.values()),
+            topics=list(topics.values()),
+            participations=participations,
+            mentions=mentions,
+            org_facts=org_facts,
+            proposed_terms=proposed,
         )
-
-
-def _unique(items: list) -> list:
-    """De-duplicate by identity, preserving order."""
-    out: list = []
-    for item in items:
-        if not any(existing is item for existing in out):
-            out.append(item)
-    return out

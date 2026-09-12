@@ -1,21 +1,35 @@
-"""Build a knowledge graph of people, places and activities from free text."""
+"""Build a support-ticket knowledge graph to decide who to notify, and why."""
 
 from graph_knowledge.models import (
-    Activity,
-    ActivityEvent,
-    Attribute,
-    Extraction,
+    Evidence,
+    Function,
+    Mention,
+    MentionRole,
+    OrgFact,
+    OrgRelation,
+    Participation,
+    ParticipationRole,
     Person,
-    Place,
-    Travel,
+    Source,
+    Team,
+    Ticket,
+    TicketExtraction,
+    Topic,
 )
 
 __all__ = [
-    "Activity",
-    "ActivityEvent",
-    "Attribute",
-    "Extraction",
+    "Evidence",
+    "Function",
+    "Mention",
+    "MentionRole",
+    "OrgFact",
+    "OrgRelation",
+    "Participation",
+    "ParticipationRole",
     "Person",
-    "Place",
-    "Travel",
+    "Source",
+    "Team",
+    "Ticket",
+    "TicketExtraction",
+    "Topic",
 ]

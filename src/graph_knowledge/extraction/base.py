@@ -1,21 +1,16 @@
-"""The extractor seam.
-
-Everything downstream depends on `Extraction`, never on how it was produced,
-so the baseline extractor can be swapped for an LLM-backed one without the
-store or the tests changing.
-"""
+"""The extractor seam."""
 
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from graph_knowledge.models import Extraction
+from graph_knowledge.models import Ticket, TicketExtraction
 
 __all__ = ["Extractor"]
 
 
 @runtime_checkable
 class Extractor(Protocol):
-    def extract(self, text: str, doc_id: str) -> Extraction:
-        """Turn a passage of text into entities and relationships."""
+    def extract(self, text: str, ticket: Ticket | str) -> TicketExtraction:
+        """Turn ticket text into people, topics, participation and org facts."""
         ...

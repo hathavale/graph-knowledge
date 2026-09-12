@@ -1,12 +1,11 @@
-"""Ingest text and inspect the resulting graph."""
+"""Ingest a ticket and show what the graph learned."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 
-from graph_knowledge.extraction import LLMExtractor, RuleBasedExtractor
-from graph_knowledge.extraction.base import Extractor
+from graph_knowledge.extraction import LLMExtractor
 from graph_knowledge.extraction.llm import DEFAULT_MODEL
 from graph_knowledge.pipeline import Pipeline
 from graph_knowledge.store.base import GraphStore
@@ -22,31 +21,15 @@ def build_store(backend: str, path: str) -> GraphStore:
     return EmbeddedStore(path)
 
 
-def build_extractor(kind: str, model: str, effort: str | None) -> Extractor:
-    if kind == "llm":
-        return LLMExtractor(model=model, effort=effort)
-    return RuleBasedExtractor()
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="graph-knowledge")
-    parser.add_argument("text", nargs="?", help="text to ingest; omit to read stdin")
-    parser.add_argument("--doc-id", default="cli", help="document id (scopes unnamed entities)")
+    parser.add_argument("text", nargs="?", help="ticket text; omit to read stdin")
+    parser.add_argument("--ticket-id", default="CLI-1")
     parser.add_argument("--backend", choices=["neo4j", "embedded"], default="neo4j")
     parser.add_argument("--path", default="./data/graph", help="embedded backend path")
-    parser.add_argument("--person", help="after ingesting, show this person's graph")
-    parser.add_argument(
-        "--extractor",
-        choices=["rule", "llm"],
-        default="rule",
-        help="rule: offline baseline; llm: Claude with a validated schema (needs ANTHROPIC_API_KEY)",
-    )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="model for --extractor llm")
-    parser.add_argument(
-        "--effort",
-        choices=["low", "medium", "high", "xhigh", "max"],
-        help="thinking effort for --extractor llm; omit for the API default",
-    )
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    parser.add_argument("--topic", help="after ingesting, show candidates for this topic")
     args = parser.parse_args(argv)
 
     text = args.text if args.text is not None else sys.stdin.read()
@@ -56,31 +39,44 @@ def main(argv: list[str] | None = None) -> int:
     store = build_store(args.backend, args.path)
     store.initialize()
     try:
-        extractor = build_extractor(args.extractor, args.model, args.effort)
-        extraction = Pipeline(extractor, store).ingest(text, args.doc_id)
+        vocabulary = store.load_vocabulary()
+        pipeline = Pipeline(
+            LLMExtractor(vocabulary=vocabulary, model=args.model, effort=args.effort),
+            store,
+            vocabulary,
+        )
+        extraction = pipeline.ingest(text, args.ticket_id)
 
-        print(f"Extracted from {args.doc_id!r}:")
+        print(f"Ticket {extraction.ticket.id}:")
         for person in extraction.people:
-            print(f"  Person   name={person.name!r} gender={person.gender!r}")
-        for travel in extraction.travels:
-            print(f"  Travel   {travel.person.name} -> {travel.place.type or travel.place.name}")
-        for event in extraction.activities:
-            place = event.place.type or event.place.name if event.place else None
-            attrs = ", ".join(
-                f"{a.name}={a.value!r}" for a in event.activity.attributes
-            )
-            print(f"  Activity {event.person.name} :: {event.activity.type!r} at={place!r} [{attrs}]")
+            aliases = f" ({', '.join(person.aliases)})" if person.aliases else ""
+            print(f"  Person       {person.name}{aliases}")
+        for topic in extraction.topics:
+            print(f"  Topic        {topic.name}")
+        for p in extraction.participations:
+            print(f"  Participated {p.person.name} as {p.role.value}")
+        for m in extraction.mentions:
+            about = f" about {m.topic.name!r}" if m.topic else ""
+            confidence = m.evidence.confidence if m.evidence else None
+            print(f"  Mentioned    {m.person.name} as {m.role.value}{about} ({confidence})")
+            if m.evidence:
+                print(f"               “{m.evidence.excerpt}”")
+        for f in extraction.org_facts:
+            confidence = f.evidence.confidence if f.evidence else None
+            print(f"  Org          {f.person.name} {f.relation.value} {f.target}"
+                  f" [{f.source.value}, {confidence}]")
+        if extraction.proposed_terms:
+            print(f"  Proposed     {', '.join(extraction.proposed_terms)}"
+                  f"  (not canonical until enough tickets support them)")
 
-        name = args.person or (extraction.people[0].name if extraction.people else None)
-        if name:
-            print(f"\nGraph for {name!r}:")
-            for row in store.travels_for(name):
-                print(f"  TRAVEL   -> Place(type={row.place_type!r}) at {row.travel_datetime}")
-            for row in store.activities_for(name):
-                print(
-                    f"  ACTIVITY {row.activity_type!r} at Place(type={row.place_type!r})"
-                    f" attribute {row.attribute_name!r}={row.attribute_value!r}"
-                )
+        topic = args.topic or (extraction.topics[0].name if extraction.topics else None)
+        if topic:
+            print(f"\nWho to consider for {topic!r}:")
+            for row in store.experts_for_topic(topic):
+                print(f"  {row.person_name}: {row.expert_mentions} expert mention(s), "
+                      f"{row.participations} ticket(s) worked")
+                for excerpt in row.excerpts[:2]:
+                    print(f"      “{excerpt}”")
         return 0
     finally:
         store.close()
