@@ -8,7 +8,9 @@ install:  ## Install the package plus dev, embedded and llm extras
 	pip install -e '.[dev,embedded,llm]'
 
 up:  ## Start Neo4j and wait for it to be healthy
-	docker compose up -d --wait
+	@docker compose up -d --wait || { \
+		echo ""; echo "Neo4j did not come up. Last 40 log lines:"; echo ""; \
+		docker compose logs --tail 40 neo4j; exit 1; }
 
 down:  ## Stop Neo4j (data in ./neo4j survives)
 	docker compose down
